@@ -1,0 +1,778 @@
+*&---------------------------------------------------------------------*
+*& Report ZHR_CARGA_BLOQ_INFTY
+*&---------------------------------------------------------------------*
+*& Carga masiva de bloqueos usuario + infotipo desde archivo local
+*& hacia la tabla ZHR_BLOQ_INFTY
+*&
+*& Formato del archivo (una pareja por linea, separada por espacio,
+*& tabulador, ; o ,):
+*&   usuario1 0001
+*&   usuario1 0002
+*&   usuario2 0001
+*&---------------------------------------------------------------------*
+REPORT zhr_carga_bloq_infty.
+
+TYPES: BEGIN OF ty_reg,
+         bname          TYPE xubname,
+         infotipo_desde TYPE infty,
+         infotipo_hasta TYPE infty,
+         begda          TYPE begda,
+         endda          TYPE endda,
+       END OF ty_reg.
+
+TYPES: BEGIN OF ty_log,
+         linea   TYPE i,
+         bname   TYPE c LENGTH 12,
+         inf_d   TYPE c LENGTH 4,
+         inf_h   TYPE c LENGTH 4,
+         tipo    TYPE c LENGTH 1,   " E = error, D = duplicado, X = ya existe, I = insertado
+         msg     TYPE c LENGTH 80,
+       END OF ty_log.
+
+DATA: gt_lineas TYPE STANDARD TABLE OF string,
+      gt_ok     TYPE SORTED TABLE OF ty_reg
+                WITH UNIQUE KEY bname infotipo_desde infotipo_hasta,
+      gt_exist  TYPE SORTED TABLE OF ty_reg
+                WITH UNIQUE KEY bname infotipo_desde infotipo_hasta,
+      gt_nuevos TYPE STANDARD TABLE OF ty_reg,
+      gt_db     TYPE STANDARD TABLE OF zhr_bloq_infty,
+      gt_log    TYPE STANDARD TABLE OF ty_log.
+
+DATA: gv_file TYPE string.
+
+*----------------------------------------------------------------------*
+* Pantalla de seleccion
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-b01.
+PARAMETERS: p_file TYPE localfile OBLIGATORY.
+PARAMETERS: p_test AS CHECKBOX DEFAULT 'X'.   " Simulacion: no graba
+SELECTION-SCREEN END OF BLOCK b1.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+  PERFORM f4_archivo.
+
+START-OF-SELECTION.
+  PERFORM leer_archivo.
+  PERFORM procesar_lineas.
+  PERFORM excluir_existentes.
+  PERFORM grabar.
+  PERFORM mostrar_log.
+
+*----------------------------------------------------------------------*
+FORM f4_archivo.
+  DATA: lt_files TYPE filetable,
+        lv_rc    TYPE i,
+        ls_file  TYPE file_table.
+
+  cl_gui_frontend_services=>file_open_dialog(
+    EXPORTING
+      window_title = 'Seleccione el archivo'
+      file_filter  = 'Archivos de texto (*.txt;*.csv)|*.txt;*.csv|Todos (*.*)|*.*'
+    CHANGING
+      file_table   = lt_files
+      rc           = lv_rc
+    EXCEPTIONS
+      OTHERS       = 1 ).
+  IF sy-subrc = 0 AND lv_rc > 0.
+    READ TABLE lt_files INTO ls_file INDEX 1.
+    p_file = ls_file-filename.
+  ENDIF.
+ENDFORM.
+
+*----------------------------------------------------------------------*
+FORM leer_archivo.
+  gv_file = p_file.
+
+  cl_gui_frontend_services=>gui_upload(
+    EXPORTING
+      filename = gv_file
+      filetype = 'ASC'
+    CHANGING
+      data_tab = gt_lineas
+    EXCEPTIONS
+      file_open_error         = 1
+      file_read_error         = 2
+      no_batch                = 3
+      gui_refuse_filetransfer = 4
+      invalid_type            = 5
+      no_authority            = 6
+      unknown_error           = 7
+      bad_data_format         = 8
+      header_too_long         = 9
+      unknown_dp_error        = 10
+      access_denied           = 11
+      dp_out_of_memory        = 12
+      disk_full               = 13
+      dp_timeout              = 14
+      not_supported_by_gui    = 15
+      error_no_gui            = 16
+      OTHERS                  = 17 ).
+  IF sy-subrc <> 0.
+    MESSAGE 'Error al leer el archivo' TYPE 'S' DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  IF gt_lineas IS INITIAL.
+    MESSAGE 'El archivo esta vacio' TYPE 'S' DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+ENDFORM.
+
+*----------------------------------------------------------------------*
+* Parsea, valida formato/existencia y elimina repetidos dentro del archivo
+*----------------------------------------------------------------------*
+FORM procesar_lineas.
+  DATA: lv_linea  TYPE string,
+        lv_nro    TYPE i,
+        lv_user   TYPE c LENGTH 40,
+        lv_desde  TYPE c LENGTH 40,
+        lv_hasta  TYPE c LENGTH 40,
+        lv_fbeg   TYPE c LENGTH 40,
+        lv_fend   TYPE c LENGTH 40,
+        lv_extra  TYPE c LENGTH 40,
+        lv_inf_d  TYPE infty,
+        lv_inf_h  TYPE infty,
+        lv_bname  TYPE xubname,
+        lv_begda  TYPE begda,
+        lv_endda  TYPE endda,
+        ls_reg    TYPE ty_reg,
+        ls_log    TYPE ty_log,
+        lv_dummy  TYPE xubname,
+        lv_dummy2 TYPE infty.
+
+  LOOP AT gt_lineas INTO lv_linea.
+    lv_nro = sy-tabix.
+
+    " Limpieza: CR, tabuladores, ; y , como separadores
+    REPLACE ALL OCCURRENCES OF cl_abap_char_utilities=>cr_lf(1)
+       IN lv_linea WITH ` `.
+    REPLACE ALL OCCURRENCES OF cl_abap_char_utilities=>horizontal_tab
+       IN lv_linea WITH ` `.
+    REPLACE ALL OCCURRENCES OF ';' IN lv_linea WITH ` `.
+    REPLACE ALL OCCURRENCES OF ',' IN lv_linea WITH ` `.
+    CONDENSE lv_linea.
+
+    IF lv_linea IS INITIAL.
+      CONTINUE.                       " linea en blanco
+    ENDIF.
+
+    CLEAR: lv_user, lv_desde, lv_hasta, lv_fbeg, lv_fend, lv_extra, ls_log.
+    SPLIT lv_linea AT space INTO lv_user lv_desde lv_hasta lv_fbeg lv_fend lv_extra.
+
+    ls_log-linea = lv_nro.
+    ls_log-bname = lv_user.
+    ls_log-inf_d = lv_desde.
+    ls_log-inf_h = lv_hasta.
+
+    " --- Validaciones de formato ---
+    IF lv_user IS INITIAL OR lv_desde IS INITIAL OR lv_hasta IS INITIAL
+       OR lv_fbeg IS INITIAL OR lv_fend IS INITIAL OR lv_extra IS NOT INITIAL.
+      ls_log-tipo = 'E'.
+      ls_log-msg  = 'Formato invalido (usuario,inf_desde,inf_hasta,fecha_desde,fecha_hasta)'.
+      APPEND ls_log TO gt_log.
+      CONTINUE.
+    ENDIF.
+
+    IF strlen( lv_user ) > 12.
+      ls_log-tipo = 'E'.
+      ls_log-msg  = 'Usuario excede 12 caracteres'.
+      APPEND ls_log TO gt_log.
+      CONTINUE.
+    ENDIF.
+
+    IF strlen( lv_desde ) > 4 OR lv_desde CN '0123456789 '
+       OR strlen( lv_hasta ) > 4 OR lv_hasta CN '0123456789 '.
+      ls_log-tipo = 'E'.
+      ls_log-msg  = 'Infotipos deben ser numericos de hasta 4 digitos'.
+      APPEND ls_log TO gt_log.
+      CONTINUE.
+    ENDIF.
+
+    lv_bname = to_upper( lv_user ).
+    lv_inf_d = lv_desde.
+    lv_inf_h = lv_hasta.
+    UNPACK lv_inf_d TO lv_inf_d.               " 1 -> 0001
+    UNPACK lv_inf_h TO lv_inf_h.
+
+    ls_log-bname = lv_bname.
+    ls_log-inf_d = lv_inf_d.
+    ls_log-inf_h = lv_inf_h.
+
+    IF lv_inf_d > lv_inf_h.
+      ls_log-tipo = 'E'.
+      ls_log-msg  = 'Infotipo desde es mayor que infotipo hasta'.
+      APPEND ls_log TO gt_log.
+      CONTINUE.
+    ENDIF.
+
+    " --- Validacion de fechas (dd.mm.aaaa) ---
+    IF strlen( lv_fbeg ) <> 10 OR strlen( lv_fend ) <> 10
+       OR lv_fbeg+2(1) <> '.' OR lv_fbeg+5(1) <> '.'
+       OR lv_fend+2(1) <> '.' OR lv_fend+5(1) <> '.'.
+      ls_log-tipo = 'E'.
+      ls_log-msg  = 'Fechas deben tener formato dd.mm.aaaa'.
+      APPEND ls_log TO gt_log.
+      CONTINUE.
+    ENDIF.
+
+    PERFORM p_fecha USING lv_fbeg CHANGING lv_begda.
+    PERFORM p_fecha USING lv_fend CHANGING lv_endda.
+
+    CALL FUNCTION 'DATE_CHECK_PLAUSIBILITY'
+      EXPORTING
+        date                      = lv_begda
+      EXCEPTIONS
+        plausibility_check_failed = 1
+        OTHERS                    = 2.
+    IF sy-subrc <> 0.
+      ls_log-tipo = 'E'.
+      ls_log-msg  = 'Fecha desde invalida'.
+      APPEND ls_log TO gt_log.
+      CONTINUE.
+    ENDIF.
+
+    CALL FUNCTION 'DATE_CHECK_PLAUSIBILITY'
+      EXPORTING
+        date                      = lv_endda
+      EXCEPTIONS
+        plausibility_check_failed = 1
+        OTHERS                    = 2.
+    IF sy-subrc <> 0.
+      ls_log-tipo = 'E'.
+      ls_log-msg  = 'Fecha hasta invalida'.
+      APPEND ls_log TO gt_log.
+      CONTINUE.
+    ENDIF.
+
+    IF lv_begda > lv_endda.
+      ls_log-tipo = 'E'.
+      ls_log-msg  = 'Fecha desde es mayor que fecha hasta'.
+      APPEND ls_log TO gt_log.
+      CONTINUE.
+    ENDIF.
+
+    " --- Validacion de usuario SAP ---
+    SELECT SINGLE bname FROM usr02 INTO lv_dummy WHERE bname = lv_bname.
+    IF sy-subrc <> 0.
+      ls_log-tipo = 'E'.
+      ls_log-msg  = 'Usuario no existe en SAP (USR02)'.
+      APPEND ls_log TO gt_log.
+      CONTINUE.
+    ENDIF.
+
+    " --- Validacion de infotipos ---
+    SELECT SINGLE infty FROM t582a INTO lv_dummy2 WHERE infty = lv_inf_d.
+    IF sy-subrc <> 0.
+      ls_log-tipo = 'E'.
+      ls_log-msg  = 'Infotipo desde no existe (T582A)'.
+      APPEND ls_log TO gt_log.
+      CONTINUE.
+    ENDIF.
+
+    SELECT SINGLE infty FROM t582a INTO lv_dummy2 WHERE infty = lv_inf_h.
+    IF sy-subrc <> 0.
+      ls_log-tipo = 'E'.
+      ls_log-msg  = 'Infotipo hasta no existe (T582A)'.
+      APPEND ls_log TO gt_log.
+      CONTINUE.
+    ENDIF.
+
+    " --- Control de repetidos dentro del archivo ---
+    CLEAR ls_reg.
+    ls_reg-bname          = lv_bname.
+    ls_reg-infotipo_desde = lv_inf_d.
+    ls_reg-infotipo_hasta = lv_inf_h.
+    ls_reg-begda          = lv_begda.
+    ls_reg-endda          = lv_endda.
+    INSERT ls_reg INTO TABLE gt_ok.
+    IF sy-subrc <> 0.
+      ls_log-tipo = 'D'.
+      ls_log-msg  = 'Repetido en el archivo (ignorado)'.
+      APPEND ls_log TO gt_log.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+*----------------------------------------------------------------------*
+* Descarta los registros que ya estan en ZHR_BLOQ_INFTY
+*----------------------------------------------------------------------*
+FORM excluir_existentes.
+  DATA: ls_reg TYPE ty_reg,
+        ls_log TYPE ty_log.
+
+  IF gt_ok IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  SELECT bname infotipo_desde infotipo_hasta
+    FROM zhr_bloq_infty
+    INTO CORRESPONDING FIELDS OF TABLE gt_exist
+    FOR ALL ENTRIES IN gt_ok
+    WHERE bname          = gt_ok-bname
+      AND infotipo_desde = gt_ok-infotipo_desde
+      AND infotipo_hasta = gt_ok-infotipo_hasta.
+
+  LOOP AT gt_ok INTO ls_reg.
+    READ TABLE gt_exist TRANSPORTING NO FIELDS
+         WITH TABLE KEY bname          = ls_reg-bname
+                        infotipo_desde = ls_reg-infotipo_desde
+                        infotipo_hasta = ls_reg-infotipo_hasta.
+    IF sy-subrc = 0.
+      CLEAR ls_log.
+      ls_log-bname = ls_reg-bname.
+      ls_log-inf_d = ls_reg-infotipo_desde.
+      ls_log-inf_h = ls_reg-infotipo_hasta.
+      ls_log-tipo  = 'X'.
+      ls_log-msg   = 'Ya existe en ZHR_BLOQ_INFTY (omitido)'.
+      APPEND ls_log TO gt_log.
+    ELSE.
+      APPEND ls_reg TO gt_nuevos.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+*----------------------------------------------------------------------*
+FORM grabar.
+  DATA: ls_reg TYPE ty_reg,
+        ls_db  TYPE zhr_bloq_infty,
+        ls_log TYPE ty_log.
+
+  LOOP AT gt_nuevos INTO ls_reg.
+    CLEAR ls_db.
+
+    ls_db-mandt          = sy-mandt.
+    ls_db-bname          = ls_reg-bname.
+    ls_db-infotipo_desde = ls_reg-infotipo_desde.
+    ls_db-infotipo_hasta = ls_reg-infotipo_hasta.
+    ls_db-begda          = ls_reg-begda.
+    ls_db-endda          = ls_reg-endda.
+    ls_db-fecha_ingreso  = sy-datum.
+    ls_db-hora           = sy-uzeit.
+    APPEND ls_db TO gt_db.
+
+    CLEAR ls_log.
+    ls_log-bname = ls_reg-bname.
+    ls_log-inf_d = ls_reg-infotipo_desde.
+    ls_log-inf_h = ls_reg-infotipo_hasta.
+    ls_log-tipo  = 'I'.
+    IF p_test = abap_true.
+      ls_log-msg = 'Se insertaria (modo simulacion)'.
+    ELSE.
+      ls_log-msg = 'Insertado'.
+    ENDIF.
+    APPEND ls_log TO gt_log.
+  ENDLOOP.
+
+  IF gt_db IS INITIAL OR p_test = abap_true.
+    RETURN.
+  ENDIF.
+
+  INSERT zhr_bloq_infty FROM TABLE gt_db ACCEPTING DUPLICATE KEYS.
+  IF sy-subrc = 0.
+    COMMIT WORK.
+  ELSE.
+    ROLLBACK WORK.
+    MESSAGE 'Hubo duplicados al insertar, revise el log' TYPE 'S' DISPLAY LIKE 'W'.
+  ENDIF.
+ENDFORM.
+
+*----------------------------------------------------------------------*
+FORM mostrar_log.
+  DATA: ls_log TYPE ty_log,
+        lv_i   TYPE i,
+        lv_d   TYPE i,
+        lv_x   TYPE i,
+        lv_e   TYPE i.
+
+  LOOP AT gt_log INTO ls_log.
+    CASE ls_log-tipo.
+      WHEN 'I'. lv_i = lv_i + 1.
+      WHEN 'D'. lv_d = lv_d + 1.
+      WHEN 'X'. lv_x = lv_x + 1.
+      WHEN 'E'. lv_e = lv_e + 1.
+    ENDCASE.
+  ENDLOOP.
+
+  IF p_test = abap_true.
+    WRITE: / '*** MODO SIMULACION: no se grabo nada ***' COLOR COL_NEGATIVE.
+  ENDIF.
+
+  WRITE: / 'Insertados / a insertar :', lv_i,
+         / 'Repetidos en archivo     :', lv_d,
+         / 'Ya existian en tabla     :', lv_x,
+         / 'Con error                :', lv_e.
+  SKIP.
+
+  WRITE: / 'Linea', 8 'Usuario', 22 'Inf.desde', 33 'Inf.hasta',
+           44 'Tipo', 49 'Mensaje'.
+  ULINE.
+
+  LOOP AT gt_log INTO ls_log.
+    CASE ls_log-tipo.
+      WHEN 'E'. FORMAT COLOR COL_NEGATIVE.
+      WHEN 'D' OR 'X'. FORMAT COLOR COL_TOTAL.
+      WHEN 'I'. FORMAT COLOR COL_POSITIVE.
+    ENDCASE.
+    WRITE: / ls_log-linea, 8 ls_log-bname, 22 ls_log-inf_d,
+             33 ls_log-inf_h, 44 ls_log-tipo, 49 ls_log-msg.
+    FORMAT COLOR OFF.
+  ENDLOOP.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  P_FECHA  (dd.mm.aaaa -> aaaammdd)
+*&---------------------------------------------------------------------*
+FORM p_fecha USING    iv_fecha TYPE c
+             CHANGING cv_fecha TYPE d.
+  CLEAR cv_fecha.
+  CONCATENATE iv_fecha+6(4)
+              iv_fecha+3(2)
+              iv_fecha+0(2)
+         INTO cv_fecha.
+ENDFORM.
+*****TYPES: BEGIN OF ty_reg,
+*****         bname TYPE xubname,
+*****         infty TYPE infty,
+*****         begda TYPE c LENGTH 10,
+*****         endda TYPE c LENGTH 10,
+*****       END OF ty_reg.
+*****
+*****
+*****TYPES: BEGIN OF ty_log,
+*****         linea TYPE i,
+*****         bname TYPE c LENGTH 12,
+*****         infty TYPE c LENGTH 4,
+*****         tipo  TYPE c LENGTH 1,      " E = error, D = duplicado, X = ya existe, I = insertado
+*****         msg   TYPE c LENGTH 80,
+*****       END OF ty_log.
+*****
+*****DATA: gt_lineas TYPE STANDARD TABLE OF string,
+*****      gt_ok     TYPE SORTED TABLE OF ty_reg WITH UNIQUE KEY bname infty,
+*****      gt_exist  TYPE SORTED TABLE OF ty_reg WITH UNIQUE KEY bname infty,
+*****      gt_nuevos TYPE STANDARD TABLE OF ty_reg,
+*****      gt_db     TYPE STANDARD TABLE OF zhr_bloq_infty,
+*****      gt_log    TYPE STANDARD TABLE OF ty_log.
+*****
+*****DATA: gv_file TYPE string.
+*****
+******----------------------------------------------------------------------*
+****** Pantalla de seleccion
+******----------------------------------------------------------------------*
+*****SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-b01.
+*****PARAMETERS: p_file TYPE localfile OBLIGATORY.
+*****PARAMETERS: p_test AS CHECKBOX DEFAULT 'X'.   " Simulacion: no graba
+*****SELECTION-SCREEN END OF BLOCK b1.
+*****
+*****AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+*****  PERFORM f4_archivo.
+*****
+*****START-OF-SELECTION.
+*****  PERFORM leer_archivo.
+*****  PERFORM procesar_lineas.
+*****  PERFORM excluir_existentes.
+*****  PERFORM grabar.
+*****  PERFORM mostrar_log.
+*****
+******----------------------------------------------------------------------*
+*****FORM f4_archivo.
+*****  DATA: lt_files TYPE filetable,
+*****        lv_rc    TYPE i,
+*****        ls_file  TYPE file_table.
+*****
+*****  cl_gui_frontend_services=>file_open_dialog(
+*****    EXPORTING
+*****      window_title = 'Seleccione el archivo'
+*****      file_filter  = 'Archivos de texto (*.txt;*.csv)|*.txt;*.csv|Todos (*.*)|*.*'
+*****    CHANGING
+*****      file_table   = lt_files
+*****      rc           = lv_rc
+*****    EXCEPTIONS
+*****      OTHERS       = 1 ).
+*****  IF sy-subrc = 0 AND lv_rc > 0.
+*****    READ TABLE lt_files INTO ls_file INDEX 1.
+*****    p_file = ls_file-filename.
+*****  ENDIF.
+*****ENDFORM.
+*****
+******----------------------------------------------------------------------*
+*****FORM leer_archivo.
+*****  gv_file = p_file.
+*****
+*****  cl_gui_frontend_services=>gui_upload(
+*****    EXPORTING
+*****      filename = gv_file
+*****      filetype = 'ASC'
+*****    CHANGING
+*****      data_tab = gt_lineas
+*****    EXCEPTIONS
+*****      file_open_error         = 1
+*****      file_read_error         = 2
+*****      no_batch                = 3
+*****      gui_refuse_filetransfer = 4
+*****      invalid_type            = 5
+*****      no_authority            = 6
+*****      unknown_error           = 7
+*****      bad_data_format         = 8
+*****      header_too_long         = 9
+*****      unknown_dp_error        = 10
+*****      access_denied           = 11
+*****      dp_out_of_memory        = 12
+*****      disk_full               = 13
+*****      dp_timeout              = 14
+*****      not_supported_by_gui    = 15
+*****      error_no_gui            = 16
+*****      OTHERS                  = 17 ).
+*****  IF sy-subrc <> 0.
+*****    MESSAGE 'Error al leer el archivo' TYPE 'S' DISPLAY LIKE 'E'.
+*****    LEAVE LIST-PROCESSING.
+*****  ENDIF.
+*****
+*****  IF gt_lineas IS INITIAL.
+*****    MESSAGE 'El archivo esta vacio' TYPE 'S' DISPLAY LIKE 'E'.
+*****    LEAVE LIST-PROCESSING.
+*****  ENDIF.
+*****ENDFORM.
+*****
+******----------------------------------------------------------------------*
+****** Parsea, valida formato/existencia y elimina repetidos dentro del archivo
+******----------------------------------------------------------------------*
+*****FORM procesar_lineas.
+*****  DATA: lv_linea TYPE string,
+*****        lv_nro   TYPE i,
+*****        lv_user  TYPE c LENGTH 40,
+*****        lv_infty TYPE c LENGTH 40,
+*****        lv_extra TYPE c LENGTH 40,
+*****        lv_inf4  TYPE infty,
+*****        lv_bname TYPE xubname,
+*****        ls_reg   TYPE ty_reg,
+*****        ls_log   TYPE ty_log,
+*****        lv_dummy TYPE xubname,
+*****        lv_dummy2 TYPE infty,
+*****        lv_begda TYPE c LENGTH 10,
+*****        lv_endda TYPE c LENGTH 10.
+*****
+*****  LOOP AT gt_lineas INTO lv_linea.
+*****    lv_nro = sy-tabix.
+*****
+*****    " Limpieza: CR, tabuladores, ; y , como separadores
+*****     REPLACE ALL OCCURRENCES OF cl_abap_char_utilities=>cr_lf(1)
+*****        IN lv_linea WITH ` `.
+*****     REPLACE ALL OCCURRENCES OF cl_abap_char_utilities=>horizontal_tab
+*****        IN lv_linea WITH ` `.
+*****     REPLACE ALL OCCURRENCES OF ';' IN lv_linea WITH ` `.
+*****     REPLACE ALL OCCURRENCES OF ',' IN lv_linea WITH ` `.
+*****     CONDENSE lv_linea.
+*****
+*****    IF lv_linea IS INITIAL.
+*****      CONTINUE.                       " linea en blanco
+*****    ENDIF.
+*****
+*****    CLEAR: lv_user, lv_infty, lv_extra, ls_log.
+*****    SPLIT lv_linea AT space INTO lv_user lv_infty lv_begda lv_endda lv_extra.
+*****
+*****    ls_log-linea = lv_nro.
+*****    ls_log-bname = lv_user.
+*****    ls_log-infty = lv_infty.
+*****
+*****    " --- Validaciones de formato ---
+*****    IF lv_user IS INITIAL OR lv_infty IS INITIAL OR lv_extra IS NOT INITIAL.
+*****      ls_log-tipo = 'E'.
+*****      ls_log-msg  = 'Formato invalido (se espera: usuario infotipo)'.
+*****      APPEND ls_log TO gt_log.
+*****      CONTINUE.
+*****    ENDIF.
+*****
+*****    IF strlen( lv_user ) > 12.
+*****      ls_log-tipo = 'E'.
+*****      ls_log-msg  = 'Usuario excede 12 caracteres'.
+*****      APPEND ls_log TO gt_log.
+*****      CONTINUE.
+*****    ENDIF.
+*****
+*****    IF strlen( lv_infty ) > 4 OR lv_infty CN '0123456789 '.
+*****      ls_log-tipo = 'E'.
+*****      ls_log-msg  = 'Infotipo debe ser numerico de hasta 4 digitos'.
+*****      APPEND ls_log TO gt_log.
+*****      CONTINUE.
+*****    ENDIF.
+*****
+*****    lv_bname = to_upper( lv_user ).
+*****    lv_inf4  = lv_infty.
+*****    UNPACK lv_inf4 TO lv_inf4.                 " 1 -> 0001
+*****
+*****    " --- Validacion de usuario SAP ---
+*****    SELECT SINGLE bname FROM usr02 INTO lv_dummy WHERE bname = lv_bname.
+*****    IF sy-subrc <> 0.
+*****      ls_log-tipo = 'E'.
+*****      ls_log-msg  = 'Usuario no existe en SAP (USR02)'.
+*****      APPEND ls_log TO gt_log.
+*****      CONTINUE.
+*****    ENDIF.
+*****
+*****    " --- Validacion de infotipo ---
+*****    SELECT SINGLE infty FROM t582a INTO lv_dummy2 WHERE infty = lv_inf4.
+*****    IF sy-subrc <> 0.
+*****      ls_log-tipo = 'E'.
+*****      ls_log-msg  = 'Infotipo no existe (T582A)'.
+*****      APPEND ls_log TO gt_log.
+*****      CONTINUE.
+*****    ENDIF.
+*****
+*****    " --- Control de repetidos dentro del archivo ---
+*****    ls_reg-bname = lv_bname.
+*****    ls_reg-infty = lv_inf4.
+*****    ls_reg-begda = lv_begda.
+*****    ls_reg-endda = lv_endda.
+*****    INSERT ls_reg INTO TABLE gt_ok.
+*****    IF sy-subrc <> 0.
+*****      ls_log-bname = lv_bname.
+*****      ls_log-infty = lv_inf4.
+*****      ls_log-tipo  = 'D'.
+*****      ls_log-msg   = 'Repetido en el archivo (ignorado)'.
+*****      APPEND ls_log TO gt_log.
+*****    ENDIF.
+*****  ENDLOOP.
+*****ENDFORM.
+*****
+******----------------------------------------------------------------------*
+****** Descarta los registros que ya estan en ZHR_BLOQ_INFTY
+******----------------------------------------------------------------------*
+*****FORM excluir_existentes.
+*****  DATA: ls_reg TYPE ty_reg,
+*****        ls_log TYPE ty_log.
+*****
+*****  IF gt_ok IS INITIAL.
+*****    RETURN.
+*****  ENDIF.
+*****
+*****  SELECT bname infty
+*****    FROM zhr_bloq_infty
+*****    INTO CORRESPONDING FIELDS OF TABLE gt_exist
+*****    FOR ALL ENTRIES IN gt_ok
+*****    WHERE bname = gt_ok-bname
+*****      AND infty = gt_ok-infty.
+*****
+*****  LOOP AT gt_ok INTO ls_reg.
+*****    READ TABLE gt_exist TRANSPORTING NO FIELDS
+*****         WITH TABLE KEY bname = ls_reg-bname infty = ls_reg-infty.
+*****    IF sy-subrc = 0.
+*****      CLEAR ls_log.
+*****      ls_log-bname = ls_reg-bname.
+*****      ls_log-infty = ls_reg-infty.
+*****      ls_log-tipo  = 'X'.
+*****      ls_log-msg   = 'Ya existe en ZHR_BLOQ_INFTY (omitido)'.
+*****      APPEND ls_log TO gt_log.
+*****    ELSE.
+*****      APPEND ls_reg TO gt_nuevos.
+*****    ENDIF.
+*****  ENDLOOP.
+*****ENDFORM.
+*****
+******----------------------------------------------------------------------*
+*****FORM grabar.
+*****  DATA: ls_reg TYPE ty_reg,
+*****        ls_db  TYPE zhr_bloq_infty,
+*****        ls_log TYPE ty_log,
+*****        lv_begda  TYPE begda,
+*****        lv_endda  TYPE endda.
+*****
+*****  LOOP AT gt_nuevos INTO ls_reg.
+*****    CLEAR ls_db.
+*****
+*****    PERFORM p_fecha USING ls_reg-begda CHANGING lv_begda.
+*****    PERFORM p_fecha USING ls_reg-endda CHANGING lv_endda.
+*****
+*****    ls_db-mandt = sy-mandt.
+*****    ls_db-bname = ls_reg-bname.
+*****    ls_db-infty = ls_reg-infty.
+*****    ls_db-BEGDA = lv_begda.
+*****    ls_db-ENDDA = lv_endda.
+*****    ls_db-fecha_ingreso = sy-datum.
+*****    ls_db-hora  = sy-uzeit.
+*****    APPEND ls_db TO gt_db.
+*****
+*****    CLEAR ls_log.
+*****    ls_log-bname = ls_reg-bname.
+*****    ls_log-infty = ls_reg-infty.
+*****    ls_log-tipo  = 'I'.
+*****    IF p_test = abap_true.
+*****      ls_log-msg = 'Se insertaria (modo simulacion)'.
+*****    ELSE.
+*****      ls_log-msg = 'Insertado'.
+*****    ENDIF.
+*****    APPEND ls_log TO gt_log.
+*****  ENDLOOP.
+*****
+*****  IF gt_db IS INITIAL OR p_test = abap_true.
+*****    RETURN.
+*****  ENDIF.
+*****
+*****  INSERT zhr_bloq_infty FROM TABLE gt_db ACCEPTING DUPLICATE KEYS.
+*****  IF sy-subrc = 0.
+*****    COMMIT WORK.
+*****  ELSE.
+*****    ROLLBACK WORK.
+*****    MESSAGE 'Hubo duplicados al insertar, revise el log' TYPE 'S' DISPLAY LIKE 'W'.
+*****  ENDIF.
+*****ENDFORM.
+*****
+******----------------------------------------------------------------------*
+*****FORM mostrar_log.
+*****  DATA: ls_log TYPE ty_log,
+*****        lv_i   TYPE i,
+*****        lv_d   TYPE i,
+*****        lv_x   TYPE i,
+*****        lv_e   TYPE i.
+*****
+*****  LOOP AT gt_log INTO ls_log.
+*****    CASE ls_log-tipo.
+*****      WHEN 'I'. lv_i = lv_i + 1.
+*****      WHEN 'D'. lv_d = lv_d + 1.
+*****      WHEN 'X'. lv_x = lv_x + 1.
+*****      WHEN 'E'. lv_e = lv_e + 1.
+*****    ENDCASE.
+*****  ENDLOOP.
+*****
+*****  IF p_test = abap_true.
+*****    WRITE: / '*** MODO SIMULACION: no se grabo nada ***' COLOR COL_NEGATIVE.
+*****  ENDIF.
+*****
+*****  WRITE: / 'Insertados / a insertar :', lv_i,
+*****         / 'Repetidos en archivo     :', lv_d,
+*****         / 'Ya existian en tabla     :', lv_x,
+*****         / 'Con error                :', lv_e.
+*****  SKIP.
+*****
+*****  WRITE: / 'Linea', 8 'Usuario', 22 'Infty', 29 'Tipo', 34 'Mensaje'.
+*****  ULINE.
+*****
+*****  LOOP AT gt_log INTO ls_log.
+*****    CASE ls_log-tipo.
+*****      WHEN 'E'. FORMAT COLOR COL_NEGATIVE.
+*****      WHEN 'D' OR 'X'. FORMAT COLOR COL_TOTAL.
+*****      WHEN 'I'. FORMAT COLOR COL_POSITIVE.
+*****    ENDCASE.
+*****    WRITE: / ls_log-linea, 8 ls_log-bname, 22 ls_log-infty,
+*****             29 ls_log-tipo, 34 ls_log-msg.
+*****    FORMAT COLOR OFF.
+*****  ENDLOOP.
+*****ENDFORM.
+******&---------------------------------------------------------------------*
+******&      Form  P_FECHA
+******&---------------------------------------------------------------------*
+******       text
+******----------------------------------------------------------------------*
+******      -->P_LS_REG_BEGDA  text
+******      <--P_LV_BEGDA  text
+******----------------------------------------------------------------------*
+*****FORM P_FECHA  USING    LS_fecha
+*****              CHANGING lv_fecha.
+*****
+*****CLEAR lv_fecha.
+*****CONCATENATE LS_fecha+6(4)
+*****            LS_fecha+3(2)
+*****            LS_fecha+0(2)
+*****       INTO lv_fecha.
+*****
+*****
+*****ENDFORM.
